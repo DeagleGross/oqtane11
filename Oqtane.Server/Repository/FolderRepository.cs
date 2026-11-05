@@ -1,0 +1,327 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Hosting;
+using Oqtane.Infrastructure;
+using Oqtane.Models;
+using Oqtane.Shared;
+
+namespace Oqtane.Repository
+{
+    public interface IFolderRepository
+    {
+        IEnumerable<Folder> GetFolders(int siteId);
+        IEnumerable<Folder> GetFolders(int siteId, int userId);
+        Folder AddFolder(Folder folder);
+        Folder UpdateFolder(Folder folder);
+        Folder GetFolder(int folderId);
+        Folder GetFolder(int folderId, bool tracking);
+        Folder GetFolder(int siteId, string path);
+        Folder GetFolder(int siteId, string path, int userId);
+        void DeleteFolder(int folderId);
+        public string GetFolderPath(int folderId);
+        public string GetFolderPath(Folder folder);
+    }
+
+    public class FolderRepository : IFolderRepository
+    {
+        private readonly IDbContextFactory<TenantDBContext> _dbContextFactory;
+        private readonly IPermissionRepository _permissions;
+        private readonly IWebHostEnvironment _environment;
+        private readonly ITenantManager _tenants;
+
+        public FolderRepository(IDbContextFactory<TenantDBContext> dbContextFactory, IPermissionRepository permissions, IWebHostEnvironment environment, ITenantManager tenants)
+        {
+            _dbContextFactory = dbContextFactory;
+            _permissions = permissions;
+            _environment = environment;
+            _tenants = tenants;
+        }
+
+        public IEnumerable<Folder> GetFolders(int siteId)
+        {
+            return GetFolders(siteId, -1);
+        }
+
+        public IEnumerable<Folder> GetFolders(int siteId, int userId)
+        {
+            using var db = _dbContextFactory.CreateDbContext();
+            var folders = db.Folder
+                .Where(item => item.SiteId == siteId && (!item.Path.StartsWith(Constants.UserFolderPath) || item.Path == Constants.UserFolderPath || item.Path.StartsWith($"{Constants.UserFolderPath}{userId}/")))
+                .Select(item => new Folder
+                {
+                    FolderId = item.FolderId,
+                    SiteId = item.SiteId,
+                    ParentId = item.ParentId,
+                    Name = item.Name,
+                    Path = item.Path,
+                    Order = item.Order,
+                    ImageSizes = item.ImageSizes,
+                    Capacity = item.Capacity,
+                    IsSystem = item.IsSystem,
+                    CacheControl = item.CacheControl,
+                    StorageProviderType = item.StorageProviderType,
+                    CreatedBy = item.CreatedBy,
+                    CreatedOn = item.CreatedOn,
+                    ModifiedBy = item.ModifiedBy,
+                    ModifiedOn = item.ModifiedOn,
+                    PermissionList = db.Permission
+                        .Include(p => p.Role)
+                        .Where(p => p.EntityName == EntityNames.Folder && p.EntityId == item.FolderId)
+                        .Select(p => new Permission
+                        {
+                            PermissionId = p.PermissionId,
+                            SiteId = p.SiteId,
+                            EntityName = p.EntityName,
+                            EntityId = p.EntityId,
+                            PermissionName = p.PermissionName,
+                            RoleId = p.RoleId,
+                            RoleName = p.Role.Name,
+                            UserId = p.UserId,
+                            IsAuthorized = p.IsAuthorized,
+                            CreatedBy = p.CreatedBy,
+                            CreatedOn = p.CreatedOn,
+                            ModifiedBy = p.ModifiedBy,
+                            ModifiedOn = p.ModifiedOn
+                        })
+                        .ToList()
+                })
+                .ToList();
+            return GetFoldersHierarchy(folders);
+        }
+
+        private static List<Folder> GetFoldersHierarchy(List<Folder> folders)
+        {
+            List<Folder> hierarchy = new List<Folder>();
+            Action<List<Folder>, Folder> getPath = null;
+            getPath = (folderList, folder) =>
+            {
+                IEnumerable<Folder> children;
+                int level;
+                if (folder == null)
+                {
+                    level = -1;
+                    children = folders.Where(item => item.ParentId == null);
+                }
+                else
+                {
+                    level = folder.Level;
+                    children = folders.Where(item => item.ParentId == folder.FolderId);
+                }
+
+                foreach (Folder child in children)
+                {
+                    child.Level = level + 1;
+                    child.HasChildren = folders.Any(item => item.ParentId == child.FolderId);
+                    hierarchy.Add(child);
+                    getPath(folderList, child);
+                }
+            };
+            folders = folders.OrderBy(item => item.Name).ToList();
+            getPath(folders, null);
+
+            // add any non-hierarchical items to the end of the list
+            foreach (Folder folder in folders)
+            {
+                if (hierarchy.Find(item => item.FolderId == folder.FolderId) == null)
+                {
+                    hierarchy.Add(folder);
+                }
+            }
+
+            return hierarchy;
+        }
+
+        public Folder AddFolder(Folder folder)
+        {
+            using var db = _dbContextFactory.CreateDbContext();
+            //build the mapped path
+            db.Folder.Add(folder);
+            db.SaveChanges();
+            _permissions.UpdatePermissions(folder.SiteId, EntityNames.Folder, folder.FolderId, folder.PermissionList);
+            return folder;
+        }
+
+        public Folder UpdateFolder(Folder folder)
+        {
+            using var db = _dbContextFactory.CreateDbContext();
+            //build the mapped path
+            db.Entry(folder).State = EntityState.Modified;
+            db.SaveChanges();
+            _permissions.UpdatePermissions(folder.SiteId, EntityNames.Folder, folder.FolderId, folder.PermissionList);
+            return folder;
+        }
+
+        public Folder GetFolder(int folderId)
+        {
+            return GetFolder(folderId, false);
+        }
+
+        public Folder GetFolder(int folderId, bool tracking)
+        {
+            // note that tracking parameter is ignored as query uses a projection
+            using var db = _dbContextFactory.CreateDbContext();
+            return db.Folder
+                .Where(item => item.FolderId == folderId)
+                .Select(item => new Folder
+                {
+                    FolderId = item.FolderId,
+                    SiteId = item.SiteId,
+                    ParentId = item.ParentId,
+                    Name = item.Name,
+                    Path = item.Path,
+                    Order = item.Order,
+                    ImageSizes = item.ImageSizes,
+                    Capacity = item.Capacity,
+                    IsSystem = item.IsSystem,
+                    CacheControl = item.CacheControl,
+                    StorageProviderType = item.StorageProviderType,
+                    CreatedBy = item.CreatedBy,
+                    CreatedOn = item.CreatedOn,
+                    ModifiedBy = item.ModifiedBy,
+                    ModifiedOn = item.ModifiedOn,
+                    PermissionList = db.Permission
+                        .Include(p => p.Role)
+                        .Where(p => p.EntityName == EntityNames.Folder && p.EntityId == item.FolderId)
+                        .Select(p => new Permission
+                        {
+                            PermissionId = p.PermissionId,
+                            SiteId = p.SiteId,
+                            EntityName = p.EntityName,
+                            EntityId = p.EntityId,
+                            PermissionName = p.PermissionName,
+                            RoleId = p.RoleId,
+                            RoleName = p.Role.Name,
+                            UserId = p.UserId,
+                            IsAuthorized = p.IsAuthorized,
+                            CreatedBy = p.CreatedBy,
+                            CreatedOn = p.CreatedOn,
+                            ModifiedBy = p.ModifiedBy,
+                            ModifiedOn = p.ModifiedOn
+                        })
+                        .ToList()
+                })
+                .FirstOrDefault();
+        }
+
+        public Folder GetFolder(int siteId, string path)
+        {
+            // note that tracking parameter is ignored as query uses a projection
+            using var db = _dbContextFactory.CreateDbContext();
+            return db.Folder
+                .Where(item => item.SiteId == siteId && item.Path == path)
+                .Select(item => new Folder
+                {
+                    FolderId = item.FolderId,
+                    SiteId = item.SiteId,
+                    ParentId = item.ParentId,
+                    Name = item.Name,
+                    Path = item.Path,
+                    Order = item.Order,
+                    ImageSizes = item.ImageSizes,
+                    Capacity = item.Capacity,
+                    IsSystem = item.IsSystem,
+                    CacheControl = item.CacheControl,
+                    StorageProviderType = item.StorageProviderType,
+                    CreatedBy = item.CreatedBy,
+                    CreatedOn = item.CreatedOn,
+                    ModifiedBy = item.ModifiedBy,
+                    ModifiedOn = item.ModifiedOn,
+                    PermissionList = db.Permission
+                        .Include(p => p.Role)
+                        .Where(p => p.EntityName == EntityNames.Folder && p.EntityId == item.FolderId)
+                        .Select(p => new Permission
+                        {
+                            PermissionId = p.PermissionId,
+                            SiteId = p.SiteId,
+                            EntityName = p.EntityName,
+                            EntityId = p.EntityId,
+                            PermissionName = p.PermissionName,
+                            RoleId = p.RoleId,
+                            RoleName = p.Role.Name,
+                            UserId = p.UserId,
+                            IsAuthorized = p.IsAuthorized,
+                            CreatedBy = p.CreatedBy,
+                            CreatedOn = p.CreatedOn,
+                            ModifiedBy = p.ModifiedBy,
+                            ModifiedOn = p.ModifiedOn
+                        })
+                        .ToList()
+                })
+                .FirstOrDefault();
+        }
+
+        public Folder GetFolder(int siteId, string path, int userId)
+        {
+            var folder = GetFolder(siteId, path);
+            if (folder == null && path.StartsWith(Constants.UserFolderPath) && path.Length != Constants.UserFolderPath.Length && userId != -1)
+            {
+                // get the parent user folder for this site 
+                folder = GetFolder(siteId, Constants.UserFolderPath);
+                if (folder != null)
+                {
+                    // create the user folder on this site (using the parent properties as defaults)
+                    AddFolder(new Folder
+                    {
+                        SiteId = folder.SiteId,
+                        ParentId = folder.FolderId,
+                        Name = "My Folder",
+                        Path = path,
+                        Order = 1,
+                        ImageSizes = folder.ImageSizes,
+                        Capacity = folder.Capacity,
+                        CacheControl = folder.CacheControl,
+                        IsSystem = true,
+                        StorageProviderType = folder.StorageProviderType,
+                        PermissionList = new List<Permission>
+                        {
+                            new Permission(PermissionNames.Browse, userId, true),
+                            new Permission(PermissionNames.View, RoleNames.Everyone, true),
+                            new Permission(PermissionNames.Edit, userId, true)
+                        }
+                    });
+                }
+                folder = GetFolder(siteId, path);
+            }
+            return folder;
+        }
+
+        public void DeleteFolder(int folderId)
+        {
+            using var db = _dbContextFactory.CreateDbContext();
+            var folder = db.Folder.Find(folderId);
+            _permissions.DeletePermissions(folder.SiteId, EntityNames.Folder, folderId);
+            db.Folder.Remove(folder);
+            db.SaveChanges();
+        }
+
+        [Obsolete("GetFolderPath(int folderId) is deprecated. Use StorageProvider instead", false)]
+        public string GetFolderPath(int folderId)
+        {
+            using var db = _dbContextFactory.CreateDbContext();
+            var folder = db.Folder
+                .AsNoTracking()
+                .FirstOrDefault(item => item.FolderId == folderId);
+            return GetFolderPath(folder);
+        }
+
+        [Obsolete("GetFolderPath(Folder folder) is deprecated. Use StorageProvider instead", false)]
+        public string GetFolderPath(Folder folder)
+        {
+            string path = "";
+            switch (folder.StorageProviderType)
+            {
+                case Constants.PrivateStorageProvider:
+                    path = Utilities.PathCombine(_environment.ContentRootPath, "Content", "Tenants", _tenants.GetTenant().TenantId.ToString(), "Sites", folder.SiteId.ToString(), folder.Path);
+                    break;
+                case Constants.PublicStorageProvider:
+                    path = Utilities.PathCombine(_environment.WebRootPath, "Content", "Tenants", _tenants.GetTenant().TenantId.ToString(), "Sites", folder.SiteId.ToString(), folder.Path);
+                    break;
+            }
+            return path;
+        }
+
+    }
+}
